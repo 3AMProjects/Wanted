@@ -1,36 +1,76 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Wanted
 
-## Getting Started
+Bounty board for finding lost animals and vehicles. A poster sets a reward and
+prepays it (plus a platform fee) into escrow; a hunter submits information and
+proof; the poster accepts or rejects, and an admin steps in only on disputes.
 
-First, run the development server:
+## Stack
+
+Next.js 15 (App Router) + TypeScript, Supabase (Auth, Postgres, Storage),
+Drizzle ORM + Zod, Tailwind. Payments sit behind `PaymentProvider`
+(`src/server/payments`) with a `mock` provider for development and a Xendit
+provider (Invoices for prepayment, Disbursements for withdrawals).
+
+## Business rules
+
+| Rule | Where |
+| --- | --- |
+| Categories: animal, vehicle | `src/db/schema.ts` |
+| Poster pays reward + `POSTING_FEE_BPS` up front | `src/domain/fees.ts`, `services/posts.ts` |
+| KYC (KTP + selfie, admin review) required to post, claim and withdraw | `services/kyc.ts`, `lib/auth.ts` |
+| One NIK can only be verified on one account | `submitKyc` |
+| Hunter claim needs info + photo/video proof; proof is private | `services/claims.ts`, `proofs` bucket |
+| Poster has `CLAIM_REVIEW_DAYS` to review; silence escalates to admin | `sweepClaims` |
+| Rejected hunter has `DISPUTE_WINDOW_DAYS` to dispute; admin decides | `openDispute`, `resolveDispute` |
+| No cancel while any claim is pending, rejected-but-disputable, or disputed | `src/domain/rules.ts` |
+| Cancel: `CANCEL_FEE_BPS` (20%) of reward kept, rest to poster balance; posting fee not refunded | `cancellationSplit` |
+| Posts expire after `POST_DURATION_DAYS` with the same split as cancel | `expireDuePosts` |
+| Withdrawal: `WITHDRAWAL_FEE_BPS` deducted from the payout | `withdrawalSplit` |
+
+Money is tracked in an append-only double-entry ledger (`ledger_entries`);
+balances are sums of entries, and every journal must sum to zero.
+
+All data access goes through the server with a privileged connection. RLS is
+enabled on every table with no policies, so the public Supabase API exposes
+nothing. Post photos are in a public bucket; proofs and KYC documents are in
+private buckets and served through 10-minute signed URLs after an
+authorisation check.
+
+## Running locally
 
 ```bash
+cp .env.example .env.local   # fill in Supabase keys and secrets
+npm install
+npm run db:migrate           # uses DIRECT_DATABASE_URL
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+With `PAYMENT_PROVIDER=mock`, checkout goes to `/dev/mock-pay` and
+withdrawals complete instantly. Mock is refused when `VERCEL_ENV=production`.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+To make yourself admin:
+`update profiles set role = 'admin' where id = '<your auth user id>';`
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+Cron: `vercel.json` calls `/api/cron/sweep` daily with
+`Authorization: Bearer $CRON_SECRET`. Xendit webhooks go to
+`/api/webhooks/payments` (set the callback token in `XENDIT_CALLBACK_TOKEN`).
 
-## Learn More
+## Tests
 
-To learn more about Next.js, take a look at the following resources:
+```bash
+npm test                                      # unit tests
+TEST_DATABASE_URL=postgres://... npm test     # + end-to-end money flow on a migrated DB
+```
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+Outside Supabase, create stub `auth.users (id uuid, email text)` and
+`storage.buckets (id text, name text, public boolean, file_size_limit bigint)`
+tables before migrating.
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+## Known gaps before launch
 
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+- Uploads go through server actions; Vercel caps request bodies at 4.5 MB.
+  Switch to direct-to-storage signed uploads.
+- The Xendit provider is untested against a real account.
+- No notifications (email/WhatsApp) yet for new claims, deadlines or decisions.
+- Refunds land in the poster's balance, so withdrawing them also pays the
+  withdrawal fee.
